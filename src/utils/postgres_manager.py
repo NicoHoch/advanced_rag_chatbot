@@ -15,17 +15,18 @@ load_dotenv()
 class PostgresManager:
     def __init__(self):
         """Initialize connection using Microsoft Entra ID authentication with token caching."""
-        # Initialize credential once (shared across instances)
+        # Use a class-level credential and token cache for efficiency
         if not hasattr(PostgresManager, "_credential"):
             PostgresManager._credential = DefaultAzureCredential()
         self.credential = PostgresManager._credential
 
-        # Cache token and expiry
         if not hasattr(PostgresManager, "_token_cache"):
             PostgresManager._token_cache = {"token": None, "expiry": None}
         self.token_cache = PostgresManager._token_cache
 
-        # Connect to database
+        self.connection = None
+        self.cursor = None
+        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
         self._connect()
 
     def _get_token(self) -> str:
@@ -46,30 +47,41 @@ class PostgresManager:
         return self.token_cache["token"]
 
     def _connect(self):
-        """Establish database connection."""
-        # Read environment variables
-        dbhost = os.environ.get("DBHOST", "your_dbhost")
-        dbname = os.environ.get("DBNAME", "your_dbname")
-        dbuser = urllib.parse.quote(os.environ.get("DBUSER", "your_dbuser"))
+        """Establish database connection using environment variables and Entra ID token."""
+        dbhost = os.environ.get("DBHOST")
+        dbname = os.environ.get("DBNAME")
+        dbuser = urllib.parse.quote(os.environ.get("DBUSER", ""))
         sslmode = os.environ.get("SSLMODE", "require")
 
-        # Get token
-        password = self._get_token()
+        if not all([dbhost, dbname, dbuser]):
+            raise ValueError(
+                "Database connection environment variables are not set properly."
+            )
 
-        # Construct connection URI
+        password = self._get_token()
         self.db_uri = (
             f"postgresql://{dbuser}:{password}@{dbhost}/{dbname}?sslmode={sslmode}"
         )
 
-        # Establish connection
+        if self.connection:
+            try:
+                self.cursor.close()
+                self.connection.close()
+            except Exception:
+                pass
+
         self.connection = psycopg2.connect(self.db_uri)
         self.connection.autocommit = True
         self.cursor = self.connection.cursor()
-        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+    def _ensure_connection(self):
+        """Ensure the database connection is alive, reconnect if needed."""
+        if not self.connection or self.connection.closed != 0:
+            self._connect()
 
     def create_tables(self):
         """Create users and documents tables and ensure admin user exists."""
-        # Create users table
+        self._ensure_connection()
         users_query = """
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -79,7 +91,6 @@ class PostgresManager:
         """
         self.cursor.execute(users_query)
 
-        # Create documents table
         documents_query = """
         CREATE TABLE IF NOT EXISTS documents (
             id SERIAL PRIMARY KEY,
@@ -89,21 +100,14 @@ class PostgresManager:
         """
         self.cursor.execute(documents_query)
 
-        # Check for admin user
         admin_username = os.environ.get("ADMIN_USERNAME", "admin")
         admin_password = os.environ.get("ADMIN_PASSWORD", "default_admin_password")
 
-        # Check if admin user exists
-        query = """
-        SELECT EXISTS (
-            SELECT 1 FROM users WHERE username = %s
-        );
-        """
+        query = "SELECT EXISTS (SELECT 1 FROM users WHERE username = %s);"
         self.cursor.execute(query, (admin_username,))
         admin_exists = self.cursor.fetchone()[0]
 
         if not admin_exists:
-            # Insert admin user with hashed password
             password_hash = self.pwd_context.hash(admin_password)
             insert_query = """
             INSERT INTO users (username, password_hash)
@@ -116,6 +120,7 @@ class PostgresManager:
 
     def insert_user(self, username: str, password: str) -> int:
         """Insert a new user with a hashed password."""
+        self._ensure_connection()
         password_hash = self.pwd_context.hash(password)
         query = """
         INSERT INTO users (username, password_hash)
@@ -127,9 +132,8 @@ class PostgresManager:
 
     def verify_user(self, username: str, password: str) -> bool:
         """Verify if the username and password match."""
-        query = """
-        SELECT password_hash FROM users WHERE username = %s;
-        """
+        self._ensure_connection()
+        query = "SELECT password_hash FROM users WHERE username = %s;"
         self.cursor.execute(query, (username,))
         result = self.cursor.fetchone()
         if result:
@@ -139,6 +143,7 @@ class PostgresManager:
 
     def insert_document(self, content: str, embedding: List[float]) -> int:
         """Insert a document."""
+        self._ensure_connection()
         query = """
         INSERT INTO documents (content, embedding)
         VALUES (%s, %s)
@@ -151,6 +156,7 @@ class PostgresManager:
         self, query_embedding: List[float], top_k: int = 5
     ) -> List[Tuple[int, str, float]]:
         """Search similar documents."""
+        self._ensure_connection()
         query = """
         SELECT id, content, embedding <-> %s AS distance
         FROM documents
@@ -162,5 +168,7 @@ class PostgresManager:
 
     def close(self):
         """Close cursor and connection."""
-        self.cursor.close()
-        self.connection.close()
+        if self.cursor:
+            self.cursor.close()
+        if self.connection:
+            self.connection.close()

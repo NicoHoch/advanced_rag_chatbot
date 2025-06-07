@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from src.models.login import LoginRequest
 from src.utils.postgres_manager import PostgresManager
 from src.utils.langgraph_manager import LanggraphManager
+from fastapi.responses import StreamingResponse
 
 app = FastAPI()
 
@@ -13,6 +14,7 @@ security = HTTPBasic()
 # Initialize PostgresManager with Azure PostgreSQL credentials
 db_manager = PostgresManager()
 langgraph_manager = LanggraphManager(db_manager.db_uri)
+graph = langgraph_manager.create_graph()
 
 # Create tables and ensure admin user on startup
 db_manager.create_tables()
@@ -41,13 +43,28 @@ class MessageRequest(BaseModel):
 def chat(
     request: MessageRequest, username: Annotated[str, Depends(get_current_username)]
 ):
-    # TODO: setup graph and invoke it here
-    return {"username": username, "message": request.message}
+    config = {"configurable": {"thread_id": "def234"}}
+
+    def event_stream():
+        latest_ai_message = None
+        for event in graph.stream(
+            {"messages": [{"role": "user", "content": request.message}]},
+            stream_mode="values",
+            config=config,
+        ):
+            for msg in event["messages"]:
+                if type(msg).__name__ == "AIMessage" and msg.content != "":
+                    latest_ai_message = msg.content
+        if latest_ai_message:
+            yield latest_ai_message + "\n"
+
+    return StreamingResponse(event_stream(), media_type="text/markdown")
 
 
 @app.post("/index")
 def index_documents(username: Annotated[str, Depends(get_current_username)]):
     """Endpoint to trigger indexing of documents."""
+    langgraph_manager.delete_all_documents()
     langgraph_manager.index_documents()
     return {"message": "Documents indexed successfully"}
 

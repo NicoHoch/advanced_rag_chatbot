@@ -2,21 +2,20 @@ import asyncio
 import getpass
 import os
 from io import BytesIO
-from typing import List, Optional, Dict, Any
-from langchain_openai import OpenAIEmbeddings
-from langchain_postgres import PGVector
+from typing import List, Any, Tuple
 from langchain.chat_models import init_chat_model
-from langchain_community.document_loaders import AzureBlobStorageFileLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langgraph.graph import MessagesState, StateGraph
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
-from azure.storage.blob import ContainerClient
-import openai
+from azure.storage.blob import ContainerClient, BlobClient
 from openai import AsyncOpenAI
 import logging
-import base64  # Import base64 for encoding images
+from dotenv import load_dotenv
+
+from src.utils.vector_store_manager import VectorStoreManager
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -25,11 +24,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class LanggraphManager:
-    """Manages document indexing and agent-based data analysis using LangChain and OpenAI Assistants API."""
+class LanggraphAgentManager:
+    """Manages the LangGraph agent for data analysis and retrieval."""
 
     def __init__(self, db_connection: str):
-        """Initialize LanggraphManager with database connection and OpenAI setup.
+        """Initialize LanggraphAgentManager with database connection and OpenAI setup.
 
         Args:
             db_connection (str): Database connection string for PGVector.
@@ -40,8 +39,9 @@ class LanggraphManager:
             "gpt-4o", model_provider="openai", temperature=0
         )  # Changed to gpt-4o for better image generation, temperature 0 for deterministic
         self.async_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        self._init_vector_store()
+        self.vector_store_manager = VectorStoreManager(db_connection)
         self.agent_executor = None
+        self.create_graph()
 
     def _load_environment(self) -> None:
         """Load and validate environment variables."""
@@ -52,133 +52,14 @@ class LanggraphManager:
                 "AZURE_STORAGE_CONNECTION_STRING environment variable is not set"
             )
 
-    def _init_vector_store(self) -> None:
-        """Initialize the vector store and embeddings."""
-        try:
-            self.embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-            self.vector_store = PGVector(
-                embeddings=self.embeddings,
-                collection_name="my_docs",
-                connection=self.db_connection,
-            )
-            logger.info("Vector store initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize vector store: {str(e)}")
-            raise
-
-    def refresh_connection(self) -> None:
-        """Refresh the connection to the vector store."""
-        logger.info("Refreshing vector store connection")
-        self._init_vector_store()
-
-    async def index_documents(self) -> Optional[List[str]]:
-        """Load, chunk, and index documents from Azure Blob Storage.
-
-        Returns:
-            Optional[List[str]]: List of document IDs indexed, or None if indexing fails.
-        """
-        try:
-            self.refresh_connection()
-            azure_connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
-            container_name = "we-are-family"
-
-            container_client = ContainerClient.from_connection_string(
-                conn_str=azure_connection_string,
-                container_name=container_name,
-            )
-
-            # List blobs for PDFs and CSVs
-            pdf_blobs = [
-                blob.name
-                for blob in container_client.list_blobs()
-                if blob.name.lower().endswith(".pdf")
-            ]
-            csv_blobs = [
-                blob.name
-                for blob in container_client.list_blobs()
-                if blob.name.lower().endswith(".csv")
-            ]
-            docs = []
-
-            # Load PDFs
-            for blob_name in pdf_blobs:
-                loader = AzureBlobStorageFileLoader(
-                    conn_str=azure_connection_string,
-                    container=container_name,
-                    blob_name=blob_name,
-                )
-                docs.extend(await asyncio.to_thread(loader.load))
-
-            # Load CSVs as text
-            for csv_blob_name in csv_blobs:
-                txt_blob_name = csv_blob_name.replace(".csv", ".txt")
-                loader = AzureBlobStorageFileLoader(
-                    conn_str=azure_connection_string,
-                    container=container_name,
-                    blob_name=txt_blob_name,
-                )
-                csv_docs = await asyncio.to_thread(loader.load)
-                for doc in csv_docs:
-                    doc.metadata["filetype"] = "csv"
-                    doc.metadata["csv_file_name"] = csv_blob_name
-                docs.extend(csv_docs)
-
-            # Split and index documents
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000, chunk_overlap=200
-            )
-            all_splits = text_splitter.split_documents(docs)
-            result = await asyncio.to_thread(
-                self.vector_store.add_documents, all_splits
-            )
-            logger.info(f"Indexed {len(result)} document chunks")
-            return result
-
-        except Exception as e:
-            logger.error(f"Error indexing documents: {str(e)}")
-            return None
-
-    async def delete_all_documents(self) -> bool:
-        """Delete all documents from the vector store.
-
-        Returns:
-            bool: True if deletion is successful, False otherwise.
-        """
-        try:
-            self.refresh_connection()
-            await asyncio.to_thread(self.vector_store.delete_collection)
-            logger.info("All documents deleted from vector store")
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting all documents: {str(e)}")
-            return False
-
-    async def delete_documents(self, ids: List[str]) -> bool:
-        """Delete documents from the vector store by their IDs.
-
-        Args:
-            ids (List[str]): List of document IDs to delete.
-
-        Returns:
-            bool: True if deletion is successful, False otherwise.
-        """
-        try:
-            self.refresh_connection()
-            await asyncio.to_thread(self.vector_store.delete, ids=ids)
-            logger.info(f"Deleted documents with IDs: {ids}")
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting documents: {str(e)}")
-            return False
-
     async def create_graph(self) -> None:
         """Create a LangGraph agent with retrieval and data analysis tools."""
         memory = MemorySaver()
-        vector_store = self.vector_store
+        vector_store = self.vector_store_manager.vector_store
 
         @tool(response_format="content_and_artifact")
-        def retrieve(query: str):
-            """Retrieve information related to a query as well as files and file locations to be used in the Code Interpreter tool.
+        def retrieve(query: str) -> Tuple[str, List[Any]]:
+            """Retrieve information related to a query. This information include csv files and file locations to be used in the analyze_data tool.
 
             Args:
                 query (str): The search query.
@@ -217,10 +98,15 @@ class LanggraphManager:
 
             try:
                 # Download CSV from Azure Blob Storage
-                blob_client = ContainerClient.from_connection_string(
+                blob_client: BlobClient = ContainerClient.from_connection_string(
                     conn_str=os.environ["AZURE_STORAGE_CONNECTION_STRING"],
                     container_name="we-are-family",
                 ).get_blob_client(csv_file_name)
+
+                # Check if the blob exists before attempting to download
+                if not await asyncio.to_thread(blob_client.exists):
+                    return [f"File {csv_file_name} not found in Azure Blob Storage."]
+
                 blob_data = await asyncio.to_thread(blob_client.download_blob().readall)
                 file_like = BytesIO(blob_data)
 
@@ -279,7 +165,6 @@ class LanggraphManager:
 
                 # Clean up: Delete the assistant and thread to free up resources
                 await self.async_client.beta.assistants.delete(assistant.id)
-                await self.async_client.beta.threads.delete(thread.id)
                 await self.async_client.files.delete(
                     uploaded_file.id
                 )  # Delete uploaded CSV

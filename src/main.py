@@ -3,6 +3,7 @@ import getpass
 import os
 from io import BytesIO
 from typing import Annotated, List, Optional, Dict, Any
+import uuid
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import StreamingResponse
@@ -15,7 +16,8 @@ import base64
 import openai
 from src.models.login import LoginRequest
 from src.utils.postgres_manager import PostgresManager
-from src.utils.langgraph_manager import LanggraphManager
+from src.utils.langgraph_manager import LanggraphAgentManager
+from src.utils.vector_store_manager import VectorStoreManager
 
 # Configure logging
 logging.basicConfig(
@@ -26,9 +28,10 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 security = HTTPBasic()
 
-# Initialize PostgresManager and LanggraphManager
+# Initialize PostgresManager and LanggraphAgentManager
 db_manager = PostgresManager()
-langgraph_manager = LanggraphManager(db_manager.db_uri)
+vector_store_manager = VectorStoreManager(db_manager.db_uri)
+langgraph_manager = LanggraphAgentManager(db_manager.db_uri)
 graph = None  # Global graph variable to store agent_executor
 
 
@@ -91,6 +94,31 @@ class MessageRequest(BaseModel):
     """Pydantic model for chat request payload."""
 
     message: str
+    session_id: str
+
+
+@app.post("/session_id")
+def get_session_id(username: Annotated[str, Depends(get_current_username)]):
+    """Get the session ID for the user.
+
+    Args:
+        username: The authenticated username.
+
+    Returns:
+        str: The session ID.
+    """
+
+    session_id = generate_session_id(username)
+    return {"session_id": session_id}
+
+
+def generate_session_id(username: str) -> str:
+    """Generate a unique session ID for the chat.
+
+    Returns:
+        str: A unique session ID.
+    """
+    return f"chat_{username}_{uuid.uuid4()}"
 
 
 @app.post("/chat")
@@ -120,7 +148,7 @@ async def chat(
             media_type="application/json",
         )
 
-    config = {"configurable": {"thread_id": f"chat_{username}_{request.message[:10]}"}}
+    config = {"configurable": {"thread_id": request.session_id}}
     logger.info(
         f"Starting chat stream for user {username} with thread_id {config['configurable']['thread_id']}"
     )
@@ -132,6 +160,7 @@ async def chat(
             r"<IMAGE_GENERATED_FILE_ID>(.*?)</IMAGE_GENERATED_FILE_ID>"
         )
         openai_async_client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        last_message = None
 
         try:
             async for event in graph.astream(
@@ -139,112 +168,114 @@ async def chat(
                 stream_mode="values",
                 config=config,
             ):
-                for msg in event.get("messages", []):
-                    if isinstance(msg, AIMessage) and msg.content:
-                        if isinstance(msg.content, str):
-                            processed_text = msg.content
-                            matches = list(
-                                image_file_id_pattern.finditer(processed_text)
+                messages = event.get("messages", [])
+                if messages:
+                    last_message = messages[-1]
+
+            if (
+                last_message
+                and isinstance(last_message, AIMessage)
+                and last_message.content
+            ):
+                processed_text = last_message.content
+                matches = list(image_file_id_pattern.finditer(processed_text))
+
+                if matches:
+                    # Process matches in order to ensure correct text segmentation
+                    last_idx = 0
+                    for match in matches:
+                        file_id = match.group(1)
+
+                        # Yield any text before the current image
+                        if match.start() > last_idx:
+                            text_before = processed_text[
+                                last_idx : match.start()
+                            ].strip()
+                            if text_before:
+                                yield json.dumps(
+                                    {
+                                        "type": "text",
+                                        "content": text_before + "\n",
+                                    }
+                                )
+
+                        logger.info(
+                            f"Detected Markdown image with file ID: {file_id}. Attempting to fetch."
+                        )
+                        try:
+                            image_data_response = (
+                                await openai_async_client.files.content(file_id)
+                            )
+                            image_bytes = image_data_response.read()
+                            if not image_bytes:
+                                logger.error(
+                                    f"No image data returned for file ID: {file_id}"
+                                )
+                                yield json.dumps(
+                                    {
+                                        "type": "text",
+                                        "content": f"Error: No image data found for file ID {file_id}\n",
+                                    }
+                                )
+                            else:
+                                encoded_image = base64.b64encode(image_bytes).decode(
+                                    "utf-8"
+                                )
+                                mime_type = "image/png"  # Assume PNG from Code Interpreter for now
+
+                                logger.info(
+                                    f"Fetched image for {file_id}. Size: {len(image_bytes)} bytes. Base64 length: {len(encoded_image)} chars."
+                                )
+
+                                try:
+                                    yield json.dumps(
+                                        {
+                                            "type": "image",
+                                            "content": encoded_image,
+                                            "mime_type": mime_type,
+                                            "alt_text": "",  # Include alt text for caption
+                                        }
+                                    ) + "\n"
+                                except Exception as send_e:
+                                    logger.error(
+                                        f"Error sending image chunk for file {file_id}: {str(send_e)}",
+                                        exc_info=True,
+                                    )
+                                    yield json.dumps(
+                                        {
+                                            "type": "text",
+                                            "content": f"Error sending image chunk: {str(send_e)}\n",
+                                        }
+                                    )
+                        except Exception as img_e:
+                            logger.error(
+                                f"Error fetching or encoding image file {file_id}: {str(img_e)}",
+                                exc_info=True,
+                            )
+                            yield json.dumps(
+                                {
+                                    "type": "text",
+                                    "content": f"Error fetching image: {str(img_e)}\n",
+                                }
                             )
 
-                            if matches:
-                                # Process matches in order to ensure correct text segmentation
-                                last_idx = 0
-                                for match in matches:
-                                    file_id = match.group(1)
+                        last_idx = match.end()
 
-                                    # Yield any text before the current image
-                                    if match.start() > last_idx:
-                                        text_before = processed_text[
-                                            last_idx : match.start()
-                                        ].strip()
-                                        if text_before:
-                                            yield json.dumps(
-                                                {
-                                                    "type": "text",
-                                                    "content": text_before + "\n",
-                                                }
-                                            )
-
-                                    logger.info(
-                                        f"Detected Markdown image with file ID: {file_id}. Attempting to fetch."
-                                    )
-                                    try:
-                                        image_data_response = (
-                                            await openai_async_client.files.content(
-                                                file_id
-                                            )
-                                        )
-                                        image_bytes = image_data_response.read()
-                                        if not image_bytes:
-                                            logger.error(
-                                                f"No image data returned for file ID: {file_id}"
-                                            )
-                                            yield json.dumps(
-                                                {
-                                                    "type": "text",
-                                                    "content": f"Error: No image data found for file ID {file_id}\n",
-                                                }
-                                            )
-                                        else:
-                                            encoded_image = base64.b64encode(
-                                                image_bytes
-                                            ).decode("utf-8")
-                                            mime_type = "image/png"  # Assume PNG from Code Interpreter for now
-
-                                            logger.info(
-                                                f"Fetched image for {file_id}. Size: {len(image_bytes)} bytes. Base64 length: {len(encoded_image)} chars."
-                                            )
-
-                                            try:
-                                                yield json.dumps(
-                                                    {
-                                                        "type": "image",
-                                                        "content": encoded_image,
-                                                        "mime_type": mime_type,
-                                                        "alt_text": "",  # Include alt text for caption
-                                                    }
-                                                ) + "\n"
-                                            except Exception as send_e:
-                                                logger.error(
-                                                    f"Error sending image chunk for file {file_id}: {str(send_e)}",
-                                                    exc_info=True,
-                                                )
-                                                yield json.dumps(
-                                                    {
-                                                        "type": "text",
-                                                        "content": f"Error sending image chunk: {str(send_e)}\n",
-                                                    }
-                                                )
-                                    except Exception as img_e:
-                                        logger.error(
-                                            f"Error fetching or encoding image file {file_id}: {str(img_e)}",
-                                            exc_info=True,
-                                        )
-                                        yield json.dumps(
-                                            {
-                                                "type": "text",
-                                                "content": f"Error fetching image: {str(img_e)}\n",
-                                            }
-                                        )
-
-                                    last_idx = match.end()
-
-                                # Yield any remaining text after the last image
-                                if last_idx < len(processed_text):
-                                    text_after = processed_text[last_idx:].strip()
-                                    if text_after:
-                                        yield json.dumps(
-                                            {
-                                                "type": "text",
-                                                "content": text_after + "\n",
-                                            }
-                                        )
-                            else:
-                                # No Markdown image found, send as plain text
-                                yield json.dumps(
-                                    {"type": "text", "content": msg.content + "\n"}
-                                )
+                    # Yield any remaining text after the last image
+                    if last_idx < len(processed_text):
+                        text_after = processed_text[last_idx:].strip()
+                        if text_after:
+                            yield json.dumps(
+                                {
+                                    "type": "text",
+                                    "content": text_after + "\n",
+                                }
+                            )
+                else:
+                    # No Markdown image found, send as plain text
+                    yield json.dumps(
+                        {"type": "text", "content": last_message.content + "\n"}
+                    )
 
         except Exception as e:
             logger.error(f"Error during streaming: {str(e)}", exc_info=True)
@@ -267,8 +298,8 @@ async def index_documents(username: Annotated[str, Depends(get_current_username)
         HTTPException: If indexing fails.
     """
     try:
-        await langgraph_manager.delete_all_documents()
-        result = await langgraph_manager.index_documents()
+        await vector_store_manager.delete_all_documents()
+        result = await vector_store_manager.index_documents()
         if result is None:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -297,7 +328,12 @@ def login(request: LoginRequest):
         HTTPException: If authentication fails.
     """
     if db_manager.verify_user(request.username, request.password):
-        return {"message": "Login successful", "username": request.username}
+        session_id = generate_session_id(request.username)
+        return {
+            "message": "Login successful",
+            "username": request.username,
+            "session_id": session_id,
+        }
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Incorrect username or password",

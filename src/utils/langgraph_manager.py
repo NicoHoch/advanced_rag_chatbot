@@ -2,7 +2,7 @@ import asyncio
 import getpass
 import os
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from langchain_openai import OpenAIEmbeddings
 from langchain_postgres import PGVector
 from langchain.chat_models import init_chat_model
@@ -16,6 +16,7 @@ from azure.storage.blob import ContainerClient
 import openai
 from openai import AsyncOpenAI
 import logging
+import base64  # Import base64 for encoding images
 
 # Configure logging
 logging.basicConfig(
@@ -35,7 +36,9 @@ class LanggraphManager:
         """
         self._load_environment()
         self.db_connection = db_connection
-        self.llm = init_chat_model("gpt-4o-mini", model_provider="openai")
+        self.llm = init_chat_model(
+            "gpt-4o", model_provider="openai", temperature=0
+        )  # Changed to gpt-4o for better image generation, temperature 0 for deterministic
         self.async_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
         self._init_vector_store()
         self.agent_executor = None
@@ -175,7 +178,7 @@ class LanggraphManager:
 
         @tool(response_format="content_and_artifact")
         def retrieve(query: str):
-            """Retrieve information related to a query.
+            """Retrieve information related to a query as well as files and file locations to be used in the Code Interpreter tool.
 
             Args:
                 query (str): The search query.
@@ -195,18 +198,22 @@ class LanggraphManager:
                 return f"Error retrieving documents: {str(e)}", []
 
         @tool(response_format="content")
-        async def analyze_data(query: str, csv_file_name: str):
+        async def analyze_data(query: str, csv_file_name: str) -> List[str]:
             """Analyze data from a CSV file using OpenAI's Code Interpreter.
+            Returns text and special markers for generated images.
 
             Args:
                 query (str): The analysis query.
                 csv_file_name (str): Name of the CSV file in Azure Blob Storage.
 
             Returns:
-                str: Analysis result or error message.
+                List[str]: A list of strings, where each string is either
+                           text content or a special marker for an image (e.g.,
+                           "<IMAGE_GENERATED_FILE_ID>file_id_here</IMAGE_GENERATED_FILE_ID>").
+                           The actual image data is retrieved and handled by the FastAPI backend.
             """
             if not csv_file_name.endswith(".csv"):
-                return "Please provide a valid CSV file path.", None
+                return ["Please provide a valid CSV file path."]
 
             try:
                 # Download CSV from Azure Blob Storage
@@ -224,7 +231,7 @@ class LanggraphManager:
 
                 # Create assistant with Code Interpreter
                 assistant = await self.async_client.beta.assistants.create(
-                    instructions=f"You are a data analyst. Analyze the file {csv_file_name} and answer: {query}",
+                    instructions=f"You are a data analyst. Analyze the file {csv_file_name} and answer: {query}. If you generate diagrams or images, respond with a textual description of the image and its purpose, then use the Code Interpreter to generate the image.",
                     model="gpt-4o",
                     tools=[{"type": "code_interpreter"}],
                     tool_resources={
@@ -250,20 +257,40 @@ class LanggraphManager:
                     await asyncio.sleep(2)
 
                 if run_status.status != "completed":
-                    return f"Run failed with status: {run_status.status}", None
+                    return [f"Run failed with status: {run_status.status}"]
 
-                # Retrieve response
-                messages = await self.async_client.beta.threads.messages.list(
-                    thread_id=thread.id
+                # Retrieve response messages, including images
+                messages_page = await self.async_client.beta.threads.messages.list(
+                    thread_id=thread.id, order="asc"
                 )
-                if messages.data and messages.data[0].content:
-                    answer = messages.data[0].content[0].text.value
-                    return answer
-                return "No response from assistant.", None
+                response_outputs = []
+                for message in messages_page.data:
+                    if message.role == "assistant":
+                        for content_block in message.content:
+                            if content_block.type == "text":
+                                response_outputs.append(content_block.text.value)
+                            elif content_block.type == "image_file":
+                                # DO NOT EMBED BASE64 HERE.
+                                # Instead, just return the file_id with a special marker.
+                                file_id = content_block.image_file.file_id
+                                response_outputs.append(
+                                    f"This is the file-id to give back to the user for displaying the image. This format needs to be preserved: <IMAGE_GENERATED_FILE_ID>{file_id}</IMAGE_GENERATED_FILE_ID>"
+                                )
+
+                # Clean up: Delete the assistant and thread to free up resources
+                await self.async_client.beta.assistants.delete(assistant.id)
+                await self.async_client.beta.threads.delete(thread.id)
+                await self.async_client.files.delete(
+                    uploaded_file.id
+                )  # Delete uploaded CSV
+
+                if not response_outputs:
+                    return ["No response from assistant."]
+                return response_outputs
 
             except Exception as e:
                 logger.error(f"Error in analyze_data tool: {str(e)}")
-                return f"Error processing file: {str(e)}", None
+                return [f"Error processing file: {str(e)}"]
 
         self.agent_executor = create_react_agent(
             self.llm, [retrieve, analyze_data], checkpointer=memory

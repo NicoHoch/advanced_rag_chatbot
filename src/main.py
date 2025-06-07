@@ -1,10 +1,18 @@
-from typing import Annotated
+import asyncio
+import getpass
+import os
+from io import BytesIO
+from typing import Annotated, List, Optional, Dict, Any
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import logging
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, BaseMessage
+import json
+import re
+import base64
+import openai
 from src.models.login import LoginRequest
 from src.utils.postgres_manager import PostgresManager
 from src.utils.langgraph_manager import LanggraphManager
@@ -30,7 +38,7 @@ async def startup_event():
     try:
         logger.info("Initializing database and LangGraph agent")
         db_manager.create_tables()  # Create database tables
-        await langgraph_manager.index_documents()  # Index documents (optional)
+        # await langgraph_manager.index_documents() # Commented out for faster startup
         await langgraph_manager.create_graph()  # Create the LangGraph agent
         global graph
         graph = langgraph_manager.agent_executor  # Assign agent_executor to graph
@@ -89,20 +97,27 @@ class MessageRequest(BaseModel):
 async def chat(
     request: MessageRequest, username: Annotated[str, Depends(get_current_username)]
 ):
-    """Stream chat responses from the LangGraph agent.
+    """Stream chat responses from the LangGraph agent, including text and images.
 
     Args:
         request: The incoming user message.
         username: The authenticated username.
 
     Returns:
-        StreamingResponse: A stream of AI-generated responses in text format.
+        StreamingResponse: A stream of AI-generated responses in JSON format.
     """
     if not hasattr(globals().get("graph"), "astream"):
         logger.error("LangGraph agent is not initialized")
         return StreamingResponse(
-            content=["Error: LangGraph agent is not initialized\n"],
-            media_type="text/plain",
+            content=[
+                json.dumps(
+                    {
+                        "type": "text",
+                        "content": "Error: LangGraph agent is not initialized\n",
+                    }
+                )
+            ],
+            media_type="application/json",
         )
 
     config = {"configurable": {"thread_id": f"chat_{username}_{request.message[:10]}"}}
@@ -111,6 +126,13 @@ async def chat(
     )
 
     async def event_stream():
+        # Regex to find Markdown image syntax with "sandbox:/file-ID"
+        # It captures the alt text and the file ID
+        image_file_id_pattern = re.compile(
+            r"<IMAGE_GENERATED_FILE_ID>(.*?)</IMAGE_GENERATED_FILE_ID>"
+        )
+        openai_async_client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
         try:
             async for event in graph.astream(
                 {"messages": [{"role": "user", "content": request.message}]},
@@ -119,12 +141,116 @@ async def chat(
             ):
                 for msg in event.get("messages", []):
                     if isinstance(msg, AIMessage) and msg.content:
-                        yield msg.content + "\n"
-        except Exception as e:
-            logger.error(f"Error during streaming: {str(e)}")
-            yield f"Error: {str(e)}\n"
+                        if isinstance(msg.content, str):
+                            processed_text = msg.content
+                            matches = list(
+                                image_file_id_pattern.finditer(processed_text)
+                            )
 
-    return StreamingResponse(event_stream(), media_type="text/plain")
+                            if matches:
+                                # Process matches in order to ensure correct text segmentation
+                                last_idx = 0
+                                for match in matches:
+                                    file_id = match.group(1)
+
+                                    # Yield any text before the current image
+                                    if match.start() > last_idx:
+                                        text_before = processed_text[
+                                            last_idx : match.start()
+                                        ].strip()
+                                        if text_before:
+                                            yield json.dumps(
+                                                {
+                                                    "type": "text",
+                                                    "content": text_before + "\n",
+                                                }
+                                            )
+
+                                    logger.info(
+                                        f"Detected Markdown image with file ID: {file_id}. Attempting to fetch."
+                                    )
+                                    try:
+                                        image_data_response = (
+                                            await openai_async_client.files.content(
+                                                file_id
+                                            )
+                                        )
+                                        image_bytes = image_data_response.read()
+                                        if not image_bytes:
+                                            logger.error(
+                                                f"No image data returned for file ID: {file_id}"
+                                            )
+                                            yield json.dumps(
+                                                {
+                                                    "type": "text",
+                                                    "content": f"Error: No image data found for file ID {file_id}\n",
+                                                }
+                                            )
+                                        else:
+                                            encoded_image = base64.b64encode(
+                                                image_bytes
+                                            ).decode("utf-8")
+                                            mime_type = "image/png"  # Assume PNG from Code Interpreter for now
+
+                                            logger.info(
+                                                f"Fetched image for {file_id}. Size: {len(image_bytes)} bytes. Base64 length: {len(encoded_image)} chars."
+                                            )
+
+                                            try:
+                                                yield json.dumps(
+                                                    {
+                                                        "type": "image",
+                                                        "content": encoded_image,
+                                                        "mime_type": mime_type,
+                                                        "alt_text": "",  # Include alt text for caption
+                                                    }
+                                                ) + "\n"
+                                            except Exception as send_e:
+                                                logger.error(
+                                                    f"Error sending image chunk for file {file_id}: {str(send_e)}",
+                                                    exc_info=True,
+                                                )
+                                                yield json.dumps(
+                                                    {
+                                                        "type": "text",
+                                                        "content": f"Error sending image chunk: {str(send_e)}\n",
+                                                    }
+                                                )
+                                    except Exception as img_e:
+                                        logger.error(
+                                            f"Error fetching or encoding image file {file_id}: {str(img_e)}",
+                                            exc_info=True,
+                                        )
+                                        yield json.dumps(
+                                            {
+                                                "type": "text",
+                                                "content": f"Error fetching image: {str(img_e)}\n",
+                                            }
+                                        )
+
+                                    last_idx = match.end()
+
+                                # Yield any remaining text after the last image
+                                if last_idx < len(processed_text):
+                                    text_after = processed_text[last_idx:].strip()
+                                    if text_after:
+                                        yield json.dumps(
+                                            {
+                                                "type": "text",
+                                                "content": text_after + "\n",
+                                            }
+                                        )
+                            else:
+                                # No Markdown image found, send as plain text
+                                yield json.dumps(
+                                    {"type": "text", "content": msg.content + "\n"}
+                                )
+
+        except Exception as e:
+            logger.error(f"Error during streaming: {str(e)}", exc_info=True)
+            yield json.dumps({"type": "text", "content": f"Error: {str(e)}\n"})
+
+    return StreamingResponse(event_stream(), media_type="application/json")
 
 
 @app.post("/index")

@@ -1,0 +1,10 @@
+fastapi[standard]
+uvicorn
+pydantic
+azure-identity
+psycopg2
+passlib
+langchain[openai]
+langgraph
+langchain-community 
+beautifulsoup4

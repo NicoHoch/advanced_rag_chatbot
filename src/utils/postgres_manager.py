@@ -141,31 +141,6 @@ class PostgresManager:
             return self.pwd_context.verify(password, password_hash)
         return False
 
-    def insert_document(self, content: str, embedding: List[float]) -> int:
-        """Insert a document."""
-        self._ensure_connection()
-        query = """
-        INSERT INTO documents (content, embedding)
-        VALUES (%s, %s)
-        RETURNING id;
-        """
-        self.cursor.execute(query, (content, embedding))
-        return self.cursor.fetchone()[0]
-
-    def search_similar_documents(
-        self, query_embedding: List[float], top_k: int = 5
-    ) -> List[Tuple[int, str, float]]:
-        """Search similar documents."""
-        self._ensure_connection()
-        query = """
-        SELECT id, content, embedding <-> %s AS distance
-        FROM documents
-        ORDER BY embedding <-> %s
-        LIMIT %s;
-        """
-        self.cursor.execute(query, (query_embedding, query_embedding, top_k))
-        return self.cursor.fetchall()
-
     def close(self):
         """Close cursor and connection."""
         if self.cursor:

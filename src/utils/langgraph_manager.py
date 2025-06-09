@@ -59,7 +59,7 @@ class LanggraphAgentManager:
 
         @tool(response_format="content_and_artifact")
         def retrieve(query: str) -> Tuple[str, List[Any]]:
-            """Retrieve information related to a query. This information include csv files and file locations to be used in the analyze_data tool.
+            """Retrieve information related to a query. This information include information about the german BIP (Bruttoinlandsprodukt), other statistical data, csv files and file locations to be used in the analyze_data tool.
 
             Args:
                 query (str): The search query.

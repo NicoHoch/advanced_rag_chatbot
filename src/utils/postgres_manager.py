@@ -1,12 +1,9 @@
-import psycopg2
-from psycopg2.extras import execute_values
-from typing import List, Tuple, Optional
+from psycopg import Connection
 from passlib.context import CryptContext
 import urllib.parse
 import os
-from azure.identity import DefaultAzureCredential
-from datetime import datetime, timezone
 from dotenv import load_dotenv
+from azure.identity import ClientSecretCredential, DefaultAzureCredential
 
 # Load environment variables from .env file
 load_dotenv()
@@ -15,14 +12,6 @@ load_dotenv()
 class PostgresManager:
     def __init__(self):
         """Initialize connection using Microsoft Entra ID authentication with token caching."""
-        # Use a class-level credential and token cache for efficiency
-        if not hasattr(PostgresManager, "_credential"):
-            PostgresManager._credential = DefaultAzureCredential()
-        self.credential = PostgresManager._credential
-
-        if not hasattr(PostgresManager, "_token_cache"):
-            PostgresManager._token_cache = {"token": None, "expiry": None}
-        self.token_cache = PostgresManager._token_cache
 
         self.connection = None
         self.cursor = None
@@ -30,21 +19,12 @@ class PostgresManager:
         self._connect()
 
     def _get_token(self) -> str:
-        """Get or refresh Entra ID token."""
-        current_time = datetime.now(timezone.utc)
-        if (
-            self.token_cache["token"] is None
-            or self.token_cache["expiry"] is None
-            or current_time >= self.token_cache["expiry"]
-        ):
-            token_response = self.credential.get_token(
-                "https://ossrdbms-aad.database.windows.net/.default"
-            )
-            self.token_cache["token"] = token_response.token
-            self.token_cache["expiry"] = datetime.fromtimestamp(
-                token_response.expires_on, timezone.utc
-            )
-        return self.token_cache["token"]
+
+        credential = DefaultAzureCredential()
+        token_response = credential.get_token(
+            "https://ossrdbms-aad.database.windows.net/.default"
+        )
+        return token_response.token
 
     def _connect(self):
         """Establish database connection using environment variables and Entra ID token."""
@@ -63,15 +43,12 @@ class PostgresManager:
             f"postgresql://{dbuser}:{password}@{dbhost}/{dbname}?sslmode={sslmode}"
         )
 
-        if self.connection:
-            try:
-                self.cursor.close()
-                self.connection.close()
-            except Exception:
-                pass
+        connection_kwargs = {
+            "autocommit": True,
+            "prepare_threshold": 0,
+        }
 
-        self.connection = psycopg2.connect(self.db_uri)
-        self.connection.autocommit = True
+        self.connection = Connection.connect(self.db_uri, **connection_kwargs)
         self.cursor = self.connection.cursor()
 
     def _ensure_connection(self):

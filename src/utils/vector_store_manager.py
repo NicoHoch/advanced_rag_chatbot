@@ -37,14 +37,8 @@ class VectorStoreManager:
             db_connection (str): Database connection string for PGVector.
         """
         self.db_connection = db_connection
-        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-        self.vector_store = PGVector(
-            embeddings=self.embeddings,
-            collection_name="my_docs",
-            connection=self.db_connection,
-        )
         self._load_environment()
-        logger.info("Vector store initialized successfully")
+        self._init_vector_store()
 
     def _load_environment(self) -> None:
         """Load and validate environment variables."""
@@ -57,7 +51,6 @@ class VectorStoreManager:
 
     def refresh_connection(self) -> None:
         """Refresh the connection to the vector store."""
-        logger.info("Refreshing vector store connection")
         self._init_vector_store()
 
     def _init_vector_store(self) -> None:

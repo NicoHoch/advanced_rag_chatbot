@@ -177,12 +177,20 @@ class LanggraphAgentManager:
                 logger.error(f"Error in analyze_data tool: {str(e)}")
                 return [f"Error processing file: {str(e)}"]
 
+        agent_prompt = """
+        You are an experienced and professional business consultant for the small company hoch-ai. 
+        You have access to the tools 'retrieve' and 'analyze_data'.
+        Always use the 'retrieve' tool first to gather information about the topic you are asked about."""
+
         self.agent_executor = create_react_agent(
-            self.llm, [retrieve, analyze_data], checkpointer=memory
+            self.llm, [retrieve, analyze_data], checkpointer=memory, prompt=agent_prompt
         )
+
         try:
             with open("graph.png", "wb") as f:
                 f.write(self.agent_executor.get_graph().draw_mermaid_png())
             logger.info("Agent graph created and saved as graph.png")
         except Exception as e:
             logger.error(f"Error saving graph: {str(e)}")
+
+        return self.agent_executor

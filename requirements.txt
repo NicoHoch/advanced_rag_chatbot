@@ -3,7 +3,6 @@ uvicorn
 pydantic
 azure-identity
 azure-storage-blob
-psycopg[binary]
 passlib
 langchain[openai]
 langgraph

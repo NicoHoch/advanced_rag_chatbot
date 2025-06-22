@@ -38,8 +38,7 @@ async def lifespan(app: FastAPI):
         logger.info("Initializing database and LangGraph agent")
         db_manager.create_tables()
         # await langgraph_manager.index_documents() # Commented out for faster startup
-        await langgraph_manager.create_graph()
-        graph = langgraph_manager.agent_executor
+        graph = await langgraph_manager.create_graph()
         if graph is None:
             raise ValueError(
                 "Failed to initialize LangGraph agent: agent_executor is None"

@@ -12,7 +12,7 @@ from openai import AsyncOpenAI
 import logging
 from dotenv import load_dotenv
 
-from src.utils.vector_store_manager import VectorStoreManager
+from src.services.vector_store_service import VectorStoreManager
 
 # Load environment variables from .env file
 load_dotenv()

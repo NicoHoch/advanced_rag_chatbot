@@ -1,9 +1,17 @@
+from typing import List
 from psycopg import Connection
 from passlib.context import CryptContext
 import urllib.parse
 import os
 from dotenv import load_dotenv
-from azure.identity import ClientSecretCredential, DefaultAzureCredential
+from azure.identity import DefaultAzureCredential
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -93,7 +101,7 @@ class PostgresManager:
             """
             self.cursor.execute(insert_query, (admin_username, password_hash))
             admin_id = self.cursor.fetchone()[0]
-            print(f"Created admin user '{admin_username}' with ID {admin_id}")
+            logger.info(f"Created admin user '{admin_username}' with ID {admin_id}")
 
     def insert_user(self, username: str, password: str) -> int:
         """Insert a new user with a hashed password."""
@@ -124,3 +132,27 @@ class PostgresManager:
             self.cursor.close()
         if self.connection:
             self.connection.close()
+
+    async def get_all_source_filenames(self) -> List[str]:
+        """Get all filenames indexed in the vector store.
+
+        Returns:
+            List[str]: List of filenames.
+        """
+        try:
+            self._ensure_connection()
+            query = (
+                "SELECT DISTINCT cmetadata->>'file_name' FROM langchain_pg_embedding "
+                "WHERE cmetadata->>'file_name' IS NOT NULL AND cmetadata->>'file_name' <> '';"
+            )
+            self.cursor.execute(query)
+            results = self.cursor.fetchall()
+
+            filenames = [row[0] for row in results]
+            logger.info(f"Retrieved {len(filenames)} filenames from the database.")
+
+            return filenames
+
+        except Exception as e:
+            logger.error(f"Error retrieving filenames: {str(e)}")
+            return []

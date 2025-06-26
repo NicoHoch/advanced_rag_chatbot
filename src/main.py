@@ -1,6 +1,5 @@
 import os
 from typing import Annotated
-import uuid
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import StreamingResponse
@@ -12,11 +11,14 @@ import re
 import base64
 import openai
 from src.models.login import LoginRequest
-from src.utils.postgres_manager import PostgresManager
-from src.utils.langgraph_manager import LanggraphAgentManager
-from src.utils.vector_store_manager import VectorStoreManager
+from src.services.postgres_service import PostgresManager
+from src.services.langgraph_service import LanggraphAgentManager
+from src.services.vector_store_service import VectorStoreManager
 from contextlib import asynccontextmanager
 from fastapi.responses import RedirectResponse
+
+from src.utils.session import generate_session_id
+from fastapi import UploadFile, File
 
 # Configure logging
 logging.basicConfig(
@@ -90,8 +92,56 @@ def get_session_id(username: Annotated[str, Depends(get_current_username)]):
     return {"session_id": session_id}
 
 
-def generate_session_id(username: str) -> str:
-    return f"chat_{username}_{uuid.uuid4()}"
+@app.get("/rag_sources")
+async def get_rag_sources(username: Annotated[str, Depends(get_current_username)]):
+    """
+    Returns the list of RAG source file names currently indexed in the database.
+    """
+    try:
+        sources = await db_manager.get_all_source_filenames()
+        return {"sources": sources}
+    except Exception as e:
+        logger.error(f"Error fetching RAG sources: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching RAG sources: {str(e)}",
+        )
+
+
+@app.post("/upload_files")
+async def upload_files(
+    username: Annotated[str, Depends(get_current_username)],
+    file: UploadFile = File(...),
+):
+    """
+    Uploads a file and indexes it as a RAG source.
+    """
+
+    try:
+        filename = file.filename
+        content = await file.read()
+        # Save file temporarily
+        temp_path = f"/tmp/{filename}"
+        with open(temp_path, "wb") as f:
+            f.write(content)
+        # Index the document
+        result = await vector_store_manager.index_document_from_file(
+            temp_path, filename
+        )
+        os.remove(temp_path)
+        if result:
+            return {"message": f"Uploaded and indexed: {filename}"}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to index {filename}",
+            )
+    except Exception as e:
+        logger.error(f"Error uploading file: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error uploading file: {str(e)}",
+        )
 
 
 @app.post("/chat")

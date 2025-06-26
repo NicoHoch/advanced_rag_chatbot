@@ -208,6 +208,7 @@ class VectorStoreManager:
                                 "extracted_page": extracted_page,
                                 "source": blob_name,
                                 "has_context": context_needed,
+                                "file_name": os.path.basename(blob_name),
                             },
                         )
                         docs.append(vision_doc)
@@ -238,6 +239,7 @@ class VectorStoreManager:
                     for doc in csv_docs:
                         doc.metadata["filetype"] = "csv"
                         doc.metadata["csv_file_name"] = csv_blob_name
+                        doc.metadata["file_name"] = os.path.basename(csv_blob_name)
                     docs.extend(csv_docs)
                 else:
                     logger.warning(
